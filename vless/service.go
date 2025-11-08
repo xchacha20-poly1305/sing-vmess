@@ -7,6 +7,8 @@ import (
 	"net"
 
 	"github.com/sagernet/sing-vmess"
+	"github.com/sagernet/sing-vmess/vless/encryption"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -23,6 +25,8 @@ type Service[T comparable] struct {
 	userFlow map[T]string
 	logger   logger.Logger
 	handler  Handler
+
+	decryption *encryption.Service
 }
 
 type Handler interface {
@@ -30,11 +34,44 @@ type Handler interface {
 	N.UDPConnectionHandlerEx
 }
 
-func NewService[T comparable](logger logger.Logger, handler Handler) *Service[T] {
+func NewService[T comparable](ctx context.Context, decryptionOptions string, logger logger.Logger, handler Handler) (*Service[T], error) {
+	var decryption *encryption.Service
+	switch decryptionOptions {
+	case "", "none":
+	default:
+		xorMode, secondsFrom, secondsTo, nfsKeyBytes, paddings, err := encryption.ParseDecryption(decryptionOptions)
+		if err != nil {
+			return nil, E.Cause(err, "parse decryption")
+		}
+		decryption, err = encryption.NewService(ctx, nfsKeyBytes, xorMode, secondsFrom, secondsTo, paddings)
+		if err != nil {
+			return nil, E.Cause(err, "create decryption")
+		}
+	}
 	return &Service[T]{
 		logger:  logger,
 		handler: handler,
+
+		decryption: decryption,
+	}, nil
+}
+
+func (s *Service[T]) Start() error {
+	if s.decryption != nil {
+		_ = s.decryption.Start()
+		var aeadType string
+		if encryption.HasAESGCMHardwareSupport {
+			aeadType = "aes"
+		} else {
+			aeadType = "chacha20"
+		}
+		s.logger.Info("decryption server started with default AEAD: ", aeadType)
 	}
+	return nil
+}
+
+func (s *Service[T]) Close() error {
+	return common.Close(s.decryption)
 }
 
 func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowList []string) {
@@ -53,6 +90,14 @@ func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowLi
 }
 
 func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
+	originConn := conn
+	if s.decryption != nil {
+		var err error
+		conn, err = s.decryption.Handshake(conn, nil)
+		if err != nil {
+			return E.Cause(err, "decryption handshake")
+		}
+	}
 	request, err := ReadRequest(conn)
 	if err != nil {
 		return err
@@ -76,7 +121,7 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	responseConn := &serverConn{ExtendedConn: bufio.NewExtendedConn(conn)}
 	switch userFlow {
 	case FlowVision:
-		conn, err = NewVisionConn(responseConn, conn, request.UUID, s.logger)
+		conn, err = NewVisionConn(responseConn, originConn, request.UUID, s.logger)
 		if err != nil {
 			return E.Cause(err, "initialize vision")
 		}

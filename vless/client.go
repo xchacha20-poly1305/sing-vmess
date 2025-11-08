@@ -1,12 +1,14 @@
 package vless
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
 	"sync"
 
 	"github.com/sagernet/sing-vmess"
+	"github.com/sagernet/sing-vmess/vless/encryption"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -22,9 +24,11 @@ type Client struct {
 	key    [16]byte
 	flow   string
 	logger logger.Logger
+
+	encryption *encryption.Client
 }
 
-func NewClient(userId string, flow string, logger logger.Logger) (*Client, error) {
+func NewClient(ctx context.Context, userId string, flow string, encryptionOptions string, logger logger.Logger) (*Client, error) {
 	user, err := uuid.FromString(userId)
 	if err != nil {
 		user = uuid.NewV5(uuid.Nil, userId)
@@ -34,7 +38,27 @@ func NewClient(userId string, flow string, logger logger.Logger) (*Client, error
 	default:
 		return nil, E.New("unsupported flow: " + flow)
 	}
-	return &Client{user, flow, logger}, nil
+	var encryptionClient *encryption.Client
+	switch encryptionOptions {
+	case "", "none":
+	default:
+		xorMode, seconds, nfsPKeysBytes, paddings, err := encryption.ParseEncryption(encryptionOptions)
+		if err != nil {
+			return nil, err
+		}
+		encryptionClient, err = encryption.NewClient(ctx, nfsPKeysBytes, xorMode, seconds, paddings)
+		if err != nil {
+			return nil, err
+		}
+		var aeadType string
+		if encryption.HasAESGCMHardwareSupport {
+			aeadType = "aes"
+		} else {
+			aeadType = "chacha20"
+		}
+		logger.Info("Using encryption client with AEAD: ", aeadType)
+	}
+	return &Client{user, flow, logger, encryptionClient}, nil
 }
 
 func (c *Client) prepareConn(conn net.Conn, tlsConn net.Conn) (net.Conn, error) {
@@ -49,8 +73,16 @@ func (c *Client) prepareConn(conn net.Conn, tlsConn net.Conn) (net.Conn, error) 
 }
 
 func (c *Client) DialConn(conn net.Conn, destination M.Socksaddr) (net.Conn, error) {
+	tlsConn := conn
+	if c.encryption != nil {
+		var err error
+		conn, err = c.encryption.Handshake(conn)
+		if err != nil {
+			return nil, err
+		}
+	}
 	remoteConn := NewConn(conn, c.key, vmess.CommandTCP, destination, c.flow)
-	protocolConn, err := c.prepareConn(remoteConn, conn)
+	protocolConn, err := c.prepareConn(remoteConn, tlsConn)
 	if err != nil {
 		return nil, err
 	}
@@ -58,21 +90,51 @@ func (c *Client) DialConn(conn net.Conn, destination M.Socksaddr) (net.Conn, err
 }
 
 func (c *Client) DialEarlyConn(conn net.Conn, destination M.Socksaddr) (net.Conn, error) {
-	return c.prepareConn(NewConn(conn, c.key, vmess.CommandTCP, destination, c.flow), conn)
+	tlsConn := conn
+	if c.encryption != nil {
+		var err error
+		conn, err = c.encryption.Handshake(conn)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return c.prepareConn(NewConn(conn, c.key, vmess.CommandTCP, destination, c.flow), tlsConn)
 }
 
 func (c *Client) DialPacketConn(conn net.Conn, destination M.Socksaddr) (*PacketConn, error) {
+	if c.encryption != nil {
+		var err error
+		conn, err = c.encryption.Handshake(conn)
+		if err != nil {
+			return nil, err
+		}
+	}
 	serverConn := &PacketConn{Conn: conn, key: c.key, destination: destination, flow: c.flow}
 	return serverConn, common.Error(serverConn.Write(nil))
 }
 
 func (c *Client) DialEarlyPacketConn(conn net.Conn, destination M.Socksaddr) (*PacketConn, error) {
+	if c.encryption != nil {
+		var err error
+		conn, err = c.encryption.Handshake(conn)
+		if err != nil {
+			return nil, err
+		}
+	}
 	return &PacketConn{Conn: conn, key: c.key, destination: destination, flow: c.flow}, nil
 }
 
 func (c *Client) DialXUDPPacketConn(conn net.Conn, destination M.Socksaddr) (vmess.PacketConn, error) {
+	tlsConn := conn
+	if c.encryption != nil {
+		var err error
+		conn, err = c.encryption.Handshake(conn)
+		if err != nil {
+			return nil, err
+		}
+	}
 	remoteConn := NewConn(conn, c.key, vmess.CommandTCP, destination, c.flow)
-	protocolConn, err := c.prepareConn(remoteConn, conn)
+	protocolConn, err := c.prepareConn(remoteConn, tlsConn)
 	if err != nil {
 		return nil, err
 	}
@@ -80,8 +142,16 @@ func (c *Client) DialXUDPPacketConn(conn net.Conn, destination M.Socksaddr) (vme
 }
 
 func (c *Client) DialEarlyXUDPPacketConn(conn net.Conn, destination M.Socksaddr) (vmess.PacketConn, error) {
+	tlsConn := conn
+	if c.encryption != nil {
+		var err error
+		conn, err = c.encryption.Handshake(conn)
+		if err != nil {
+			return nil, err
+		}
+	}
 	remoteConn := NewConn(conn, c.key, vmess.CommandMux, destination, c.flow)
-	protocolConn, err := c.prepareConn(remoteConn, conn)
+	protocolConn, err := c.prepareConn(remoteConn, tlsConn)
 	if err != nil {
 		return nil, err
 	}
