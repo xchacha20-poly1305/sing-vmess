@@ -75,7 +75,6 @@ func useAesFromContext(ctx context.Context) bool {
 }
 
 var (
-	_ net.Conn             = (*CommonConn)(nil)
 	_ N.ExtendedConn       = (*CommonConn)(nil)
 	_ N.FrontHeadroom      = (*CommonConn)(nil)
 	_ N.RearHeadroom       = (*CommonConn)(nil)
@@ -94,7 +93,9 @@ type CommonConn struct {
 	aead        *AEAD
 	peerAEAD    *AEAD
 	peerPadding []byte
-	peerHeader  [HeaderLength]byte
+
+	// reuse peer header buffer here to avoid escape
+	peerHeader [HeaderLength]byte
 
 	// These two field are required by vision's reflect, DO NOT CHANGE
 	rawInput bytes.Buffer // Read buffer
@@ -143,15 +144,10 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// WriteBuffer implements N.ExtendedWriter.
-//
-// When the buffer carries the headroom advertised by FrontHeadroom() and
-// RearHeadroom(), the record is framed and sealed in place, saving the
-// allocation and the copy of the whole payload that Write() has to do.
 func (c *CommonConn) WriteBuffer(buffer *buf.Buffer) error {
+	defer buffer.Release()
 	dataLen := buffer.Len()
 	if dataLen == 0 {
-		buffer.Release()
 		return nil
 	}
 	overhead := c.aead.Overhead()
@@ -159,10 +155,8 @@ func (c *CommonConn) WriteBuffer(buffer *buf.Buffer) error {
 		c.preWrite != nil || // client's 0-RTT, needs more front headroom than advertised
 		buffer.Start() < HeaderLength ||
 		buffer.FreeLen() < overhead {
-		defer buffer.Release()
 		return common.Error(c.Write(buffer.Bytes()))
 	}
-	defer buffer.Release()
 	header := buffer.ExtendHeader(HeaderLength)
 	encodeHeader(header, dataLen+overhead)
 	nonceGotMax := bytes.Equal(c.aead.Nonce[:], maxNonce)
@@ -189,10 +183,6 @@ func (c *CommonConn) Read(b []byte) (n int, err error) {
 	return c.readChunk(b)
 }
 
-// ReadBuffer implements N.ExtendedReader.
-//
-// The record is read into the free space of the buffer and opened in place
-// when it fits, avoiding the staging copy through rawInput.
 func (c *CommonConn) ReadBuffer(buffer *buf.Buffer) error {
 	if buffer.FreeLen() == 0 {
 		return io.ErrShortBuffer
@@ -323,23 +313,18 @@ func (c *CommonConn) SetWriteDeadline(t time.Time) error {
 	return c.conn.SetWriteDeadline(t)
 }
 
-// FrontHeadroom is the length of the record header prepended by WriteBuffer.
 func (c *CommonConn) FrontHeadroom() int {
 	return HeaderLength
 }
 
-// RearHeadroom is the length of the AEAD tag appended by WriteBuffer.
 func (c *CommonConn) RearHeadroom() int {
 	return AEADTagLength
 }
 
-// WriterMTU keeps the payload of a buffer within the size of a single record,
-// so that WriteBuffer never has to fall back to the fragmenting Write().
 func (c *CommonConn) WriterMTU() int {
 	return XrayBufferSize
 }
 
-// ReaderMTU is the largest payload a peer record can carry.
 func (c *CommonConn) ReaderMTU() int {
 	return MaxPacketLength - AEADTagLength
 }
@@ -399,7 +384,7 @@ func (a *AEAD) Overhead() int {
 }
 
 func increaseNonce(nonce []byte) []byte {
-	for i := 0; i < NonceLength; i++ {
+	for i := range NonceLength {
 		nonce[NonceLength-1-i]++
 		if nonce[NonceLength-1-i] != 0 {
 			break

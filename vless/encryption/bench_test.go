@@ -50,10 +50,7 @@ func (r *countingReader) Read(b []byte) (int, error) {
 	if r.remaining <= 0 {
 		return 0, io.EOF
 	}
-	n := copy(b, r.data)
-	if n > r.remaining {
-		n = r.remaining
-	}
+	n := min(copy(b, r.data), r.remaining)
 	r.remaining -= n
 	return n, nil
 }
@@ -90,7 +87,7 @@ func benchmarkWrite(b *testing.B, useAES, extended bool) {
 	b.SetBytes(benchStreamSize)
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_, err := bufio.Copy(destination, &countingReader{data: source, remaining: benchStreamSize})
 		if err != nil {
 			b.Fatal(err)
@@ -139,7 +136,7 @@ func benchmarkRead(b *testing.B, useAES, extended bool) {
 	b.SetBytes(benchStreamSize)
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		b.StopTimer()
 		conn := NewCommonConn(&benchConn{source: stream}, useAES)
 		conn.unitedKey = unitedKey
