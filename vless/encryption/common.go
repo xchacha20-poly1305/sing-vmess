@@ -75,7 +75,11 @@ func useAesFromContext(ctx context.Context) bool {
 }
 
 var (
-	_ net.Conn             = (*CommonConn)(nil)
+	_ N.ExtendedConn       = (*CommonConn)(nil)
+	_ N.FrontHeadroom      = (*CommonConn)(nil)
+	_ N.RearHeadroom       = (*CommonConn)(nil)
+	_ N.ReaderWithMTU      = (*CommonConn)(nil)
+	_ N.WriterWithMTU      = (*CommonConn)(nil)
 	_ N.ReaderWithUpstream = (*CommonConn)(nil)
 	_ N.WriterWithUpstream = (*CommonConn)(nil)
 )
@@ -89,6 +93,9 @@ type CommonConn struct {
 	aead        *AEAD
 	peerAEAD    *AEAD
 	peerPadding []byte
+
+	// reuse peer header buffer here to avoid escape
+	peerHeader [HeaderLength]byte
 
 	// These two field are required by vision's reflect, DO NOT CHANGE
 	rawInput bytes.Buffer // Read buffer
@@ -137,15 +144,74 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+func (c *CommonConn) WriteBuffer(buffer *buf.Buffer) error {
+	defer buffer.Release()
+	dataLen := buffer.Len()
+	if dataLen == 0 {
+		return nil
+	}
+	overhead := c.aead.Overhead()
+	if dataLen > XrayBufferSize || // needs to be fragmented
+		c.preWrite != nil || // client's 0-RTT, needs more front headroom than advertised
+		buffer.Start() < HeaderLength ||
+		buffer.FreeLen() < overhead {
+		return common.Error(c.Write(buffer.Bytes()))
+	}
+	header := buffer.ExtendHeader(HeaderLength)
+	encodeHeader(header, dataLen+overhead)
+	nonceGotMax := bytes.Equal(c.aead.Nonce[:], maxNonce)
+	c.aead.Seal(buffer.Index(HeaderLength), nil, buffer.From(HeaderLength), header)
+	buffer.Extend(overhead)
+	if nonceGotMax {
+		c.aead = NewAEAD(buffer.Bytes(), c.unitedKey, c.useAES)
+	}
+	return common.Error(c.conn.Write(buffer.Bytes()))
+}
+
 func (c *CommonConn) Read(b []byte) (n int, err error) {
 	if len(b) == 0 {
 		return
 	}
+	err = c.readPrologue()
+	if err != nil {
+		return
+	}
+	if c.input.Len() > 0 {
+		n, err = c.input.Read(b)
+		return
+	}
+	return c.readChunk(b)
+}
+
+func (c *CommonConn) ReadBuffer(buffer *buf.Buffer) error {
+	if buffer.FreeLen() == 0 {
+		return io.ErrShortBuffer
+	}
+	err := c.readPrologue()
+	if err != nil {
+		return err
+	}
+	var n int
+	if c.input.Len() > 0 {
+		n, err = c.input.Read(buffer.FreeBytes())
+	} else {
+		n, err = c.readChunk(buffer.FreeBytes())
+	}
+	if err != nil {
+		return err
+	}
+	buffer.Truncate(buffer.Len() + n)
+	return nil
+}
+
+// readPrologue reads the parts of the server response that precede the first
+// record: the server random of a 0-RTT connection and the 1-RTT padding.
+func (c *CommonConn) readPrologue() error {
 	if c.peerAEAD == nil { // client's 0-RTT
 		serverRandom := make([]byte, IVLength)
-		_, err = io.ReadFull(c.conn, serverRandom)
+		_, err := io.ReadFull(c.conn, serverRandom)
 		if err != nil {
-			return
+			return err
 		}
 		c.peerAEAD = NewAEAD(serverRandom, c.unitedKey, c.useAES)
 		if xorConn, isXorConn := c.conn.(*XorConn); isXorConn {
@@ -153,21 +219,23 @@ func (c *CommonConn) Read(b []byte) (n int, err error) {
 		}
 	}
 	if c.peerPadding != nil { // client's 1-RTT
-		_, err = io.ReadFull(c.conn, c.peerPadding)
+		_, err := io.ReadFull(c.conn, c.peerPadding)
 		if err != nil {
-			return
+			return err
 		}
 		_, err = c.peerAEAD.Open(c.peerPadding[:0], nil, c.peerPadding, nil)
 		if err != nil {
-			return
+			return err
 		}
 		c.peerPadding = nil
 	}
-	if c.input.Len() > 0 {
-		n, err = c.input.Read(b)
-		return
-	}
-	peerHeader := make([]byte, HeaderLength)
+	return nil
+}
+
+// readChunk reads one record, writes as much plaintext as fits into b and
+// caches the remainder in input.
+func (c *CommonConn) readChunk(b []byte) (n int, err error) {
+	peerHeader := c.peerHeader[:]
 	_, err = io.ReadFull(c.conn, peerHeader)
 	if err != nil {
 		return
@@ -185,10 +253,15 @@ func (c *CommonConn) Read(b []byte) (n int, err error) {
 		return
 	}
 	c.client = nil
-	if c.rawInput.Cap() < l {
-		c.rawInput.Grow(l) // we are always reading
+	var peerData []byte
+	if len(b) >= l {
+		peerData = b[:l] // avoids the copy through rawInput, opened in place below
+	} else {
+		if c.rawInput.Cap() < l {
+			c.rawInput.Grow(l) // we are always reading
+		}
+		peerData = c.rawInput.Bytes()[:l]
 	}
-	peerData := c.rawInput.Bytes()[:l]
 	_, err = io.ReadFull(c.conn, peerData)
 	if err != nil {
 		return
@@ -199,7 +272,7 @@ func (c *CommonConn) Read(b []byte) (n int, err error) {
 	}
 	var newAEAD *AEAD
 	if bytes.Equal(c.peerAEAD.Nonce[:], maxNonce) {
-		newAEAD = NewAEAD(append(peerHeader, peerData...), c.unitedKey, c.useAES)
+		newAEAD = NewAEAD(append(bytes.Clone(peerHeader), peerData...), c.unitedKey, c.useAES)
 	}
 	_, err = c.peerAEAD.Open(dst[:0], nil, peerData, peerHeader)
 	if newAEAD != nil {
@@ -238,6 +311,22 @@ func (c *CommonConn) SetReadDeadline(t time.Time) error {
 
 func (c *CommonConn) SetWriteDeadline(t time.Time) error {
 	return c.conn.SetWriteDeadline(t)
+}
+
+func (c *CommonConn) FrontHeadroom() int {
+	return HeaderLength
+}
+
+func (c *CommonConn) RearHeadroom() int {
+	return AEADTagLength
+}
+
+func (c *CommonConn) WriterMTU() int {
+	return XrayBufferSize
+}
+
+func (c *CommonConn) ReaderMTU() int {
+	return MaxPacketLength - AEADTagLength
 }
 
 func (c *CommonConn) WriterReplaceable() bool {
@@ -295,7 +384,7 @@ func (a *AEAD) Overhead() int {
 }
 
 func increaseNonce(nonce []byte) []byte {
-	for i := 0; i < NonceLength; i++ {
+	for i := range NonceLength {
 		nonce[NonceLength-1-i]++
 		if nonce[NonceLength-1-i] != 0 {
 			break
