@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/sagernet/sing-vmess"
+	"github.com/sagernet/sing-vmess/packetaddr"
 	"github.com/sagernet/sing-vmess/vless/encryption"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
@@ -122,6 +123,28 @@ func (c *Client) DialEarlyPacketConn(conn net.Conn, destination M.Socksaddr) (*P
 		}
 	}
 	return &PacketConn{Conn: conn, key: c.key, destination: destination, flow: c.flow}, nil
+}
+
+func (c *Client) DialStreamPacketAddrConn(conn net.Conn, destination M.Socksaddr) (*packetaddr.StreamPacketConn, error) {
+	if destination.IsFqdn() {
+		return nil, E.Extend(packetaddr.ErrFqdnUnsupported, destination.Fqdn)
+	}
+	streamConn, err := c.DialConn(conn, M.Socksaddr{Fqdn: packetaddr.StreamPacketMagicAddress})
+	if err != nil {
+		return nil, err
+	}
+	return packetaddr.NewStreamConn(streamConn, destination), nil
+}
+
+func (c *Client) DialEarlyStreamPacketAddrConn(conn net.Conn, destination M.Socksaddr) (*packetaddr.StreamPacketConn, error) {
+	if destination.IsFqdn() {
+		return nil, E.Extend(packetaddr.ErrFqdnUnsupported, destination.Fqdn)
+	}
+	streamConn, err := c.DialEarlyConn(conn, M.Socksaddr{Fqdn: packetaddr.StreamPacketMagicAddress})
+	if err != nil {
+		return nil, err
+	}
+	return packetaddr.NewStreamConn(streamConn, destination), nil
 }
 
 func (c *Client) DialXUDPPacketConn(conn net.Conn, destination M.Socksaddr) (vmess.PacketConn, error) {
